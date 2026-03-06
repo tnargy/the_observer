@@ -14,7 +14,10 @@ from sqlalchemy.orm import sessionmaker, relationship
 # Load env
 load_dotenv()
 
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///collector.db')
+DATABASE_URL = os.getenv('DATABASE_URL')
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable required")
+
 OFFLINE_SECONDS = int(os.getenv('OFFLINE_SECONDS', '10'))
 
 app = Flask(__name__)
