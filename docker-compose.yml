@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: observer
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: observer
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+
+  collector:
+    build:
+      context: ./collector
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://observer:password@postgres:5432/observer
+      OFFLINE_SECONDS: '10'
+      SECRET_KEY: 'dev-secret'
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./collector:/app
+    restart: unless-stopped
+
+volumes:
+  pgdata:
