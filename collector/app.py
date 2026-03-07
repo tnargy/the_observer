@@ -1,12 +1,17 @@
+"""Collector HTTP and WebSocket server.
+
+Provides endpoints to receive metrics from agents and broadcast
+updates to connected dashboards via Socket.IO.
+"""
+
 import os
 import time
-import threading
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, Float, String, DateTime, ForeignKey, Index
+    create_engine, Column, BigInteger, Float, String, DateTime, ForeignKey, Index
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -25,7 +30,7 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret')
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
 
 engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine)
+session_local = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # In-memory registry for quick status + last metrics
@@ -65,8 +70,34 @@ def to_iso(dt):
     return dt.isoformat() if dt else None
 
 
+def load_agents_registry():
+    """Load existing agents from the database into the in-memory registry.
+
+    This populates `agents_registry` from the persistent `agents` table so
+    dashboards have initial state on server start.
+    """
+    session = session_local()
+    try:
+        agents = session.query(Agent).all()
+        now = datetime.utcnow()
+        for a in agents:
+            last_seen = a.last_seen or a.registered_at
+            status = 'online' if last_seen and (now - last_seen).total_seconds() < OFFLINE_SECONDS else 'offline'
+            agents_registry[a.id] = {
+                'last_seen': last_seen or now,
+                'status': status,
+                'metrics': None,
+                'hostname': a.hostname,
+                'ip_address': a.ip_address,
+                'registered_at': a.registered_at
+            }
+    finally:
+        session.close()
+
+
 @app.route('/api/metrics', methods=['POST'])
 def post_metrics():
+    """Receive metrics from an agent and persist + broadcast them."""
     try:
         data = request.get_json()
         if not data or 'agent_id' not in data or 'metrics' not in data:
@@ -76,15 +107,24 @@ def post_metrics():
         metrics = data['metrics']
         timestamp = data.get('timestamp', int(time.time()))
 
-        session = SessionLocal()
+        session = session_local()
 
-        # Ensure agent exists
-        agent = session.query(Agent).get(agent_id)
+        # Ensure agent exists and capture IP/hostname
+        agent = session.get(Agent, agent_id)
+        ip_addr = request.remote_addr
+        hostname = data.get('hostname', agent_id)
         if not agent:
-            agent = Agent(id=agent_id, hostname=agent_id, last_seen=datetime.utcnow())
+            agent = Agent(
+                id=agent_id,
+                hostname=hostname,
+                ip_address=ip_addr,
+                last_seen=datetime.utcnow(),
+            )
             session.add(agent)
         else:
             agent.last_seen = datetime.utcnow()
+            agent.ip_address = ip_addr or agent.ip_address
+            agent.hostname = hostname or agent.hostname
 
         # Insert metric
         metric = Metric(
@@ -103,7 +143,10 @@ def post_metrics():
         agents_registry[agent_id] = {
             'last_seen': datetime.utcnow(),
             'status': 'online',
-            'metrics': metrics
+            'metrics': metrics,
+            'hostname': hostname,
+            'ip_address': ip_addr,
+            'registered_at': agent.registered_at
         }
 
         # Broadcast via socket
@@ -112,11 +155,12 @@ def post_metrics():
             'metrics': metrics,
             'status': 'online',
             'timestamp': int(timestamp)
-        }, broadcast=True)
+        })
 
         return jsonify({'status': 'ok'}), 200
 
-    except Exception as e:
+    except Exception as exc:
+        # Log full stack trace for debugging
         app.logger.exception('Error processing /api/metrics')
         return jsonify({'error': 'server error'}), 500
 
@@ -149,7 +193,7 @@ def get_agent_metrics(agent_id):
 
     cutoff_time = int(time.time()) - (hours * 3600)
 
-    session = SessionLocal()
+    session = session_local()
     rows = session.query(Metric).filter(
         Metric.agent_id == agent_id,
         Metric.timestamp > cutoff_time
@@ -188,30 +232,47 @@ def handle_connect():
             'last_seen': info['last_seen'].isoformat()
         })
 
-    socketio.emit('connected', {'agents': agents_list})
+    # Emit only to the newly connected client (don't broadcast to everyone)
+    try:
+        socketio.emit('connected', {'agents': agents_list}, to=request.sid)
+    except Exception:
+        # Fallback: broadcast if sid not available for some reason
+        socketio.emit('connected', {'agents': agents_list})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    app.logger.info(f'Dashboard disconnected')
 
 
 def check_offline_agents_loop():
     while True:
-        now = datetime.utcnow()
-        for agent_id, info in list(agents_registry.items()):
-            seconds_since = (now - info['last_seen']).total_seconds()
-            if seconds_since > OFFLINE_SECONDS and info.get('status') != 'offline':
-                info['status'] = 'offline'
-                socketio.emit('agent_offline', {
-                    'agent_id': agent_id,
-                    'last_seen': info['last_seen'].isoformat()
-                }, broadcast=True)
-        time.sleep(OFFLINE_SECONDS)
+        try:
+            now = datetime.utcnow()
+            for agent_id, info in list(agents_registry.items()):
+                seconds_since = (now - info['last_seen']).total_seconds()
+                if seconds_since > OFFLINE_SECONDS and info.get('status') != 'offline':
+                    info['status'] = 'offline'
+                    socketio.emit('agent_offline', {
+                        'agent_id': agent_id,
+                        'last_seen': info['last_seen'].isoformat()
+                    })
+            # Use socketio.sleep for compatibility with the Socket.IO server
+            socketio.sleep(OFFLINE_SECONDS)
+        except Exception:
+            app.logger.exception('Error in offline checker')
+            socketio.sleep(OFFLINE_SECONDS)
 
 
 def start_background_thread():
-    t = threading.Thread(target=check_offline_agents_loop, daemon=True)
-    t.start()
+    # Use Socket.IO background task which cooperates with the chosen async mode
+    socketio.start_background_task(check_offline_agents_loop)
 
 
 if __name__ == '__main__':
     # Create tables if they don't exist
     Base.metadata.create_all(engine)
+    # Load agents from DB into in-memory registry
+    load_agents_registry()
     start_background_thread()
     socketio.run(app, host='0.0.0.0', port=5000)

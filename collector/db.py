@@ -4,7 +4,7 @@ from contextlib import contextmanager
 try:
     import psycopg2
     from psycopg2 import pool
-except Exception:
+except ImportError:
     psycopg2 = None
     pool = None
 
@@ -26,12 +26,14 @@ def get_db():
 
 
 def release_db(conn):
+    """Return a connection to the pool."""
     if db_pool and conn:
         db_pool.putconn(conn)
 
 
 @contextmanager
 def db_context():
+    """Context manager that yields a DB connection and returns it to the pool."""
     conn = None
     try:
         conn = get_db()
