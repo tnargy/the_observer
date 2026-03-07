@@ -26,5 +26,14 @@ services:
       - ./collector:/app
     restart: unless-stopped
 
+  dashboard:
+    build:
+      context: ./dashboard
+    depends_on:
+      - collector
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
 volumes:
   pgdata:
