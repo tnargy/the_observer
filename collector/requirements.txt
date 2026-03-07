@@ -1,6 +1,12 @@
-Flask>=2.0
+Flask>=2.2,<3
 Flask-SocketIO>=5.3
 eventlet>=0.33
-SQLAlchemy>=1.4
+SQLAlchemy>=1.4,<2.0
 python-dotenv>=1.0
 psycopg2-binary>=2.9
+# Production WSGI server
+gunicorn>=20.1
+
+# Testing / tooling
+pytest>=7.0
+requests>=2.28
