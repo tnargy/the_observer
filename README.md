@@ -55,7 +55,7 @@ cd the_observer
 docker-compose up
 ```
 
-- **Dashboard:** http://localhost:3000  
+- **Dashboard:** http://localhost:8080  
 - **Collector API:** http://localhost:5000  
 - **PostgreSQL:** localhost:5432 (user `observer`, db `observer`)
 
@@ -64,7 +64,7 @@ Default dashboard login: `admin` / `demo` (hardcoded for Phase 1).
 ### Run the agent on a machine to monitor
 
 ```bash
-cd agent
+cd observer-agent
 cp .env.example .env
 # Edit .env: set OBSERVER_SERVER (e.g. http://your-server:5000) and optional OBSERVER_AGENT_ID
 pip install -r requirements.txt
@@ -77,7 +77,7 @@ python agent.py
 
 ```
 observer/
-├── agent/                 # Python agent (metrics collection)
+├── observer-agent/                 # Python agent (metrics collection)
 │   ├── agent.py
 │   ├── requirements.txt
 │   └── .env.example
@@ -139,9 +139,9 @@ WebSocket: connect to the collector; events include `metric_update` (broadcast w
 
 ## Deployment
 
-- **Local:** `docker-compose up` → use http://localhost:3000.
-- **Home server / Raspberry Pi:** Copy repo, run `docker-compose up -d`, open `http://<host>:3000`.
-- **VPS (e.g. DigitalOcean, Linode):** Install Docker, clone repo, `docker-compose up -d`, open `http://<droplet-ip>:3000`.
+- **Local:** `docker-compose up` → use http://localhost:8080.
+- **Home server / Raspberry Pi:** Copy repo, run `docker-compose up -d`, open `http://<host>:8080`.
+- **VPS (e.g. DigitalOcean, Linode):** Install Docker, clone repo, `docker-compose up -d`, open `http://<droplet-ip>:8080`.
 
 Ensure the collector is reachable on port 5000 from any machine running the agent, and set `OBSERVER_SERVER` accordingly.
 
