@@ -239,7 +239,7 @@ def post_metrics():
             'metrics': metrics,
             'hostname': hostname,
             'ip_address': ip_addr,
-            'registered_at': agent.registered_at
+            #'registered_at': agent.registered_at  TODO: Fixes Issue temporarily
         }
 
         # Broadcast via socket
