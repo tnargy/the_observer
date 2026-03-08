@@ -6,15 +6,19 @@ updates to connected dashboards via Socket.IO.
 
 import os
 import time
+import logging
+import random
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
+from werkzeug.exceptions import HTTPException
 from sqlalchemy import (
     create_engine, Column, BigInteger, Float, String, DateTime, ForeignKey, Index
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 # Load env
 load_dotenv()
@@ -28,6 +32,13 @@ OFFLINE_SECONDS = int(os.getenv('OFFLINE_SECONDS', '10'))
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret')
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet')
+
+# Configure logging from environment if provided
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+try:
+    app.logger.setLevel(getattr(logging, log_level))
+except Exception:
+    app.logger.setLevel(logging.INFO)
 
 engine = create_engine(DATABASE_URL, echo=False)
 session_local = sessionmaker(bind=engine)
@@ -91,53 +102,135 @@ def load_agents_registry():
                 'ip_address': a.ip_address,
                 'registered_at': a.registered_at
             }
+    except Exception:
+        app.logger.exception('Failed to load agents registry from DB')
     finally:
         session.close()
+
+
+# DB retry settings
+DB_RETRY_COUNT = int(os.getenv('DB_RETRY_COUNT', '3'))
+DB_RETRY_BASE = float(os.getenv('DB_RETRY_BASE', '0.5'))
+
+
+def _db_retry_sleep(attempt: int):
+    backoff = DB_RETRY_BASE * (2 ** (attempt - 1))
+    # add jitter
+    jitter = random.uniform(0, backoff * 0.5)
+    time.sleep(backoff + jitter)
+
+
+def validate_payload(data):
+    if not isinstance(data, dict):
+        return False, 'invalid json'
+    if 'agent_id' not in data or not isinstance(data['agent_id'], str) or not data['agent_id'].strip():
+        return False, 'missing or invalid agent_id'
+    if 'metrics' not in data or not isinstance(data['metrics'], dict):
+        return False, 'missing or invalid metrics'
+
+    metrics = data['metrics']
+    # Required numeric fields and ranges
+    try:
+        cpu = float(metrics.get('cpu_percent'))
+        mem = float(metrics.get('memory_percent'))
+        disk = float(metrics.get('disk_percent'))
+    except Exception:
+        return False, 'cpu/memory/disk must be numbers'
+
+    for v in (cpu, mem, disk):
+        if v < 0 or v > 100:
+            return False, 'percent values must be 0-100'
+
+    try:
+        net_in = int(metrics.get('network_in_bytes_per_sec', 0))
+        net_out = int(metrics.get('network_out_bytes_per_sec', 0))
+    except Exception:
+        return False, 'network io must be integers'
+    if net_in < 0 or net_out < 0:
+        return False, 'network io must be >= 0'
+
+    # Timestamp optional but if present should be reasonable
+    ts = data.get('timestamp')
+    if ts is not None:
+        try:
+            tsv = int(ts)
+            now = int(time.time())
+            if tsv < 0 or tsv > now + 300:
+                return False, 'invalid timestamp'
+        except Exception:
+            return False, 'timestamp must be integer'
+
+    return True, None
 
 
 @app.route('/api/metrics', methods=['POST'])
 def post_metrics():
     """Receive metrics from an agent and persist + broadcast them."""
     try:
-        data = request.get_json()
-        if not data or 'agent_id' not in data or 'metrics' not in data:
-            return jsonify({'error': 'missing fields'}), 400
+        try:
+            data = request.get_json()
+        except Exception:
+            app.logger.exception('Invalid JSON in request')
+            return jsonify({'error': 'invalid json or missing fields'}), 400
+
+        ok, why = validate_payload(data)
+        if not ok:
+            return jsonify({'error': why}), 400
 
         agent_id = data['agent_id']
         metrics = data['metrics']
         timestamp = data.get('timestamp', int(time.time()))
 
-        session = session_local()
+        # Retry DB writes on transient errors
+        attempt = 0
+        while True:
+            attempt += 1
+            session = session_local()
+            try:
+                # Ensure agent exists and capture IP/hostname
+                agent = session.get(Agent, agent_id)
+                ip_addr = request.remote_addr
+                hostname = data.get('hostname', agent_id)
+                if not agent:
+                    agent = Agent(
+                        id=agent_id,
+                        hostname=hostname,
+                        ip_address=ip_addr,
+                        last_seen=datetime.utcnow(),
+                    )
+                    session.add(agent)
+                else:
+                    agent.last_seen = datetime.utcnow()
+                    agent.ip_address = ip_addr or agent.ip_address
+                    agent.hostname = hostname or agent.hostname
 
-        # Ensure agent exists and capture IP/hostname
-        agent = session.get(Agent, agent_id)
-        ip_addr = request.remote_addr
-        hostname = data.get('hostname', agent_id)
-        if not agent:
-            agent = Agent(
-                id=agent_id,
-                hostname=hostname,
-                ip_address=ip_addr,
-                last_seen=datetime.utcnow(),
-            )
-            session.add(agent)
-        else:
-            agent.last_seen = datetime.utcnow()
-            agent.ip_address = ip_addr or agent.ip_address
-            agent.hostname = hostname or agent.hostname
+                # Insert metric
+                metric = Metric(
+                    agent_id=agent_id,
+                    timestamp=int(timestamp),
+                    cpu_percent=metrics.get('cpu_percent'),
+                    memory_percent=metrics.get('memory_percent'),
+                    disk_percent=metrics.get('disk_percent'),
+                    network_in_bytes=metrics.get('network_in_bytes_per_sec'),
+                    network_out_bytes=metrics.get('network_out_bytes_per_sec')
+                )
+                session.add(metric)
+                session.commit()
+                break
 
-        # Insert metric
-        metric = Metric(
-            agent_id=agent_id,
-            timestamp=int(timestamp),
-            cpu_percent=metrics.get('cpu_percent'),
-            memory_percent=metrics.get('memory_percent'),
-            disk_percent=metrics.get('disk_percent'),
-            network_in_bytes=metrics.get('network_in_bytes_per_sec'),
-            network_out_bytes=metrics.get('network_out_bytes_per_sec')
-        )
-        session.add(metric)
-        session.commit()
+            except OperationalError:
+                session.rollback()
+                app.logger.exception('OperationalError writing to DB (attempt %s)', attempt)
+                if attempt >= DB_RETRY_COUNT:
+                    return jsonify({'error': 'database error'}), 500
+                _db_retry_sleep(attempt)
+                continue
+            except SQLAlchemyError:
+                session.rollback()
+                app.logger.exception('Database error')
+                return jsonify({'error': 'database error'}), 500
+            finally:
+                session.close()
 
         # Update registry
         agents_registry[agent_id] = {
@@ -159,6 +252,9 @@ def post_metrics():
 
         return jsonify({'status': 'ok'}), 200
 
+    except ValueError as ve:
+        app.logger.exception('Value error processing /api/metrics')
+        return jsonify({'error': str(ve)}), 400
     except Exception as exc:
         # Log full stack trace for debugging
         app.logger.exception('Error processing /api/metrics')
@@ -193,27 +289,42 @@ def get_agent_metrics(agent_id):
 
     cutoff_time = int(time.time()) - (hours * 3600)
 
-    session = session_local()
-    rows = session.query(Metric).filter(
-        Metric.agent_id == agent_id,
-        Metric.timestamp > cutoff_time
-    ).order_by(Metric.timestamp.asc()).limit(3600).all()
+    try:
+        session = session_local()
+        rows = session.query(Metric).filter(
+            Metric.agent_id == agent_id,
+            Metric.timestamp > cutoff_time
+        ).order_by(Metric.timestamp.asc()).limit(3600).all()
 
-    if not rows:
-        return jsonify({'error': 'agent not found or no data'}), 404
+        if not rows:
+            return jsonify({'error': 'agent not found or no data'}), 404
 
-    result = []
-    for r in rows:
-        result.append({
-            'timestamp': r.timestamp,
-            'cpu_percent': r.cpu_percent,
-            'memory_percent': r.memory_percent,
-            'disk_percent': r.disk_percent,
-            'network_in_bytes_per_sec': r.network_in_bytes,
-            'network_out_bytes_per_sec': r.network_out_bytes
-        })
+        result = []
+        for r in rows:
+            result.append({
+                'timestamp': r.timestamp,
+                'cpu_percent': r.cpu_percent,
+                'memory_percent': r.memory_percent,
+                'disk_percent': r.disk_percent,
+                'network_in_bytes_per_sec': r.network_in_bytes,
+                'network_out_bytes_per_sec': r.network_out_bytes
+            })
 
-    return jsonify(result), 200
+        return jsonify(result), 200
+    except ValueError:
+        return jsonify({'error': 'invalid request parameters'}), 400
+    except Exception:
+        app.logger.exception('Error fetching metrics for agent %s', agent_id)
+        return jsonify({'error': 'server error'}), 500
+
+
+@app.errorhandler(Exception)
+def handle_unhandled_exception(e):
+    # Preserve HTTP exceptions with their status codes
+    if isinstance(e, HTTPException):
+        return jsonify({'error': e.description}), e.code
+    app.logger.exception('Unhandled exception')
+    return jsonify({'error': 'server error'}), 500
 
 
 @socketio.on('connect')
